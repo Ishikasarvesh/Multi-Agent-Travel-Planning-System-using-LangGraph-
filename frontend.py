@@ -1,8 +1,345 @@
 import os
+import uuid
+import json
 import streamlit as st
 from datetime import datetime
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from main import app
+from attraction_images import render_itinerary_with_inline_images
+from chat_database import (
+    create_chat_tables, create_chat, list_chats, rename_chat, delete_chat,
+    save_message, load_messages, delete_last_message, update_last_user_message,
+    save_chat_state, load_chat_state
+)
+from chat_history import generate_chat_title, parse_assistant_message
+import pandas as pd
+import re
+
+# Reusable formatting helper functions
+def render_section_title(title: str):
+    st.markdown(f"## **{title}**")
+    st.markdown("")
+
+def render_subsection_title(title: str):
+    st.markdown(f"### **{title}**")
+    st.markdown("")
+
+def render_tip(label: str, text: str):
+    st.markdown(f"> **{label}:** {text}")
+    st.markdown("")
+
+def parse_flights_to_df(flight_text: str) -> pd.DataFrame:
+    """Parses flight text into a structured DataFrame using a quick LLM call."""
+    from chat_history import llm
+    prompt = f"""
+    You are a data extraction assistant. Parse the following flight recommendations into a structured JSON list of flights.
+    
+    Flight Text:
+    {flight_text}
+    
+    Extract columns: "Airline", "Flight", "Departure", "Arrival", "Duration", "Stops", "Price".
+    Only include columns where data is available. Price should be formatted cleanly (e.g. ₹50,000).
+    
+    Output JSON format:
+    [
+        {{"Airline": "...", "Flight": "...", "Departure": "...", "Arrival": "...", "Duration": "...", "Stops": "...", "Price": "..."}}
+    ]
+    
+    Return ONLY the JSON list. Do not include markdown code block syntax (like ```json) or explanations.
+    """
+    try:
+        response = llm.invoke(prompt)
+        text = response.content.strip()
+        json_match = re.search(r'\[.*\]', text, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            return pd.DataFrame(data)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def parse_hotels_to_df(hotel_text: str) -> pd.DataFrame:
+    """Parses hotel text into a structured DataFrame using a quick LLM call."""
+    from chat_history import llm
+    prompt = f"""
+    You are a data extraction assistant. Parse the following hotel recommendations into a structured JSON list of hotels.
+    
+    Hotel Text:
+    {hotel_text}
+    
+    Extract columns: "Hotel", "Location", "Rating", "Price per Night", "Total Price", "Distance".
+    Only include columns where data is available. Rating should be a string or number (e.g., 4.5/5 or 4.5 star).
+    
+    Output JSON format:
+    [
+        {{"Hotel": "...", "Location": "...", "Rating": "...", "Price per Night": "...", "Total Price": "...", "Distance": "..."}}
+    ]
+    
+    Return ONLY the JSON. Do not include markdown code block syntax or explanations.
+    """
+    try:
+        response = llm.invoke(prompt)
+        text = response.content.strip()
+        json_match = re.search(r'\[.*\]', text, re.DOTALL)
+        if json_match:
+            data = json.loads(json_match.group(0))
+            return pd.DataFrame(data)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def parse_weather_to_data(weather_text: str) -> dict:
+    """Parses weather assistant report into structured current weather, forecast, alerts, clothing, essentials, and tip."""
+    from chat_history import llm
+    prompt = f"""
+    You are a data extraction assistant. Parse the following weather report into structured components.
+    
+    Weather Report:
+    {weather_text}
+    
+    Output JSON format:
+    {{
+        "current_weather": {{
+            "Temperature": "...",
+            "Feels Like": "...",
+            "Condition": "...",
+            "Humidity": "...",
+            "Wind": "...",
+            "UV Index": "..."
+        }},
+        "forecast": [
+            {{"Day": "...", "Condition": "...", "Minimum": "...", "Maximum": "...", "Rain Chance": "..."}}
+        ],
+        "alerts": ["warning or alert text string", "or 'No active weather alerts'"],
+        "recommended_clothing": ["item 1", "item 2"],
+        "travel_essentials": ["item 1", "item 2"],
+        "weather_tip": "..."
+    }}
+    
+    Return ONLY the JSON. Do not include markdown code block syntax or explanations.
+    """
+    try:
+        response = llm.invoke(prompt)
+        text = response.content.strip()
+        json_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if json_match:
+            return json.loads(json_match.group(0))
+    except Exception:
+        pass
+    return {}
+
+def render_flight_section(flight_results: str):
+    if not flight_results or "unavailable" in flight_results.lower():
+        return
+    render_section_title("Flight Options")
+    df = parse_flights_to_df(flight_results)
+    if not df.empty:
+        columns_priority = ["Airline", "Flight", "Departure", "Arrival", "Duration", "Stops", "Price"]
+        df_cols = [col for col in columns_priority if col in df.columns]
+        st.dataframe(df[df_cols], use_container_width=True, hide_index=True)
+    else:
+        st.markdown(re.split(r"Book on:", flight_results, flags=re.IGNORECASE)[0].strip())
+    
+    render_subsection_title("Booking Platforms")
+    st.markdown("- [MakeMyTrip](https://www.makemytrip.com/)")
+    st.markdown("- [Booking.com Flights](https://www.booking.com/flights.html)")
+    st.markdown("- [Skyscanner](https://www.skyscanner.net/)")
+    st.markdown("- [Google Flights](https://www.google.com/travel/flights)")
+    st.markdown("- [EaseMyTrip](https://www.easemytrip.com/)")
+    st.markdown("")
+    
+    tip_text = "Booking 30–60 days in advance usually offers better prices for international trips."
+    match = re.search(r"Flight Tip:\s*(.*)", flight_results, re.IGNORECASE)
+    if match:
+        tip_text = match.group(1).strip()
+    render_tip("Flight Tip", tip_text)
+
+def render_hotel_section(hotel_results: str):
+    if not hotel_results or "unavailable" in hotel_results.lower():
+        return
+    render_section_title("Hotel Recommendations")
+    df = parse_hotels_to_df(hotel_results)
+    if not df.empty:
+        columns_priority = ["Hotel", "Location", "Rating", "Price per Night", "Total Price", "Distance"]
+        df_cols = [col for col in columns_priority if col in df.columns]
+        st.dataframe(df[df_cols], use_container_width=True, hide_index=True)
+    else:
+        st.markdown(re.split(r"💡 Hotel Tip:", hotel_results, flags=re.IGNORECASE)[0].strip())
+        
+    tip_text = "Choose hotels near metro or railway stations to reduce local transport costs."
+    match = re.search(r"Hotel Tip:\s*(.*)", hotel_results, re.IGNORECASE)
+    if match:
+        tip_text = match.group(1).strip()
+    render_tip("Hotel Tip", tip_text)
+
+def render_weather_section(weather_results: str):
+    if not weather_results or "unavailable" in weather_results.lower():
+        return
+    
+    data = parse_weather_to_data(weather_results)
+    if not data:
+        st.markdown(weather_results)
+        return
+        
+    render_section_title("Weather Information")
+    
+    render_subsection_title("Current Weather")
+    curr = data.get("current_weather", {})
+    if curr:
+        curr_df = pd.DataFrame([curr])
+        st.dataframe(curr_df, use_container_width=True, hide_index=True)
+        
+    render_subsection_title("Forecast")
+    forecast = data.get("forecast", [])
+    if forecast:
+        fore_df = pd.DataFrame(forecast)
+        st.dataframe(fore_df, use_container_width=True, hide_index=True)
+        
+    render_subsection_title("Weather Alerts")
+    alerts = data.get("alerts", [])
+    if isinstance(alerts, str):
+        alerts = [alerts]
+    for alert in alerts:
+        alert_lower = alert.lower()
+        if "no active" in alert_lower or "no warnings" in alert_lower or "no alert" in alert_lower:
+            st.success(alert)
+        elif "severe" in alert_lower or "extreme" in alert_lower or "thunderstorm" in alert_lower:
+            st.error(alert)
+        else:
+            st.warning(alert)
+            
+    render_subsection_title("Recommended Clothing")
+    clothing = data.get("recommended_clothing", [])
+    if clothing:
+        if isinstance(clothing, str):
+            st.markdown(clothing)
+        else:
+            for item in clothing:
+                st.markdown(f"- {item}")
+                
+    render_subsection_title("Travel Essentials")
+    essentials = data.get("travel_essentials", [])
+    if essentials:
+        if isinstance(essentials, str):
+            st.markdown(essentials)
+        else:
+            for item in essentials:
+                st.markdown(f"- {item}")
+                
+    tip_text = data.get("weather_tip", "Schedule outdoor sightseeing before afternoon rain.")
+    render_tip("Weather Tip", tip_text)
+
+def render_itinerary_section(itinerary_text: str, user_query: str):
+    if not itinerary_text:
+        return
+    render_section_title("Day-wise Itinerary")
+    
+    clean_itinerary = re.split(r"💡 Itinerary Tip:", itinerary_text, flags=re.IGNORECASE)[0].strip()
+    render_itinerary_with_inline_images(clean_itinerary, user_query)
+    
+    tip_text = "Visit outdoor attractions early in the morning to avoid crowds and heat."
+    match = re.search(r"Itinerary Tip:\s*(.*)", itinerary_text, re.IGNORECASE)
+    if match:
+        tip_text = match.group(1).strip()
+    render_tip("Itinerary Tip", tip_text)
+
+def render_assistant_response(parsed: dict, assoc_user_query: str):
+    request_type = parsed.get("request_type", "full_plan")
+    
+    if request_type == "flight_request":
+        render_flight_section(parsed.get("flight_results", ""))
+    elif request_type == "hotel_request":
+        render_hotel_section(parsed.get("hotel_results", ""))
+    elif request_type == "weather_request":
+        render_weather_section(parsed.get("weather_results", ""))
+    elif request_type in ["duration_change", "budget_change", "itinerary_change"]:
+        render_itinerary_section(parsed.get("itinerary", ""), assoc_user_query)
+    elif request_type in ["specific_day_change", "attraction_add", "attraction_remove"]:
+        disp = parsed.get("displayed_response") or parsed.get("final_response") or ""
+        render_itinerary_section(disp, assoc_user_query)
+    elif request_type in ["plan_question", "general_conversation"]:
+        st.markdown(parsed.get("displayed_response") or parsed.get("final_response") or "")
+    else: # full_plan or destination_change or default fallback
+        if parsed.get("itinerary") or parsed.get("flight_results"):
+            render_flight_section(parsed.get("flight_results", ""))
+            st.markdown("---")
+            render_hotel_section(parsed.get("hotel_results", ""))
+            st.markdown("---")
+            render_weather_section(parsed.get("weather_results", ""))
+            st.markdown("---")
+            render_itinerary_section(parsed.get("itinerary", ""), assoc_user_query)
+        else:
+            st.markdown(parsed.get("final_response") or "")
+
+
+# Helper functions defined at the top to avoid NameError/execution order issues
+def create_empty_chat_state():
+    return {
+        "messages": [],
+        "current_plan": {},
+        "travel_results": {
+            "flight_results": "",
+            "hotel_results": "",
+            "weather_results": "",
+            "itinerary": "",
+            "final_response": "",
+            "llm_calls": 0,
+        },
+        "generated_itinerary": "",
+        "attraction_images": {},
+        "show_attraction_images": True,
+        "latest_download_content": "",
+    }
+
+def activate_chat(chat_id: str) -> None:
+    st.session_state.current_chat_id = chat_id
+    msgs = load_messages(chat_id)
+    state_data = load_chat_state(chat_id)
+    
+    st.session_state.chat_sessions[chat_id] = {
+        "messages": msgs,
+        "current_plan": state_data.get("current_plan") or {},
+        "travel_results": state_data.get("travel_results") or {
+            "flight_results": "",
+            "hotel_results": "",
+            "weather_results": "",
+            "itinerary": "",
+            "final_response": "",
+            "llm_calls": 0,
+        },
+        "generated_itinerary": state_data.get("generated_itinerary") or "",
+        "attraction_images": {},
+        "show_attraction_images": True,
+        "latest_download_content": "",
+    }
+
+def get_plan_summary(results, user_query):
+    if not results.get("itinerary"):
+        return ""
+    prompt = f"""
+    Extract a compact travel summary from this itinerary and user request.
+    Itinerary:
+    {results.get('itinerary')[:1200]}
+    
+    Latest Request:
+    {user_query}
+    
+    Output format MUST be exactly like this (fill in the details, keep it brief, do not add other headers):
+    **Destination:** [City/Country]
+    **Duration:** [X days]
+    **Budget:** [Amount]
+    **Departure:** [Departure city if mentioned, or N/A]
+    **Main cities:** [List main cities visited]
+    
+    Do not include any other text or explanation. Just the 5 lines.
+    """
+    try:
+        from chat_history import llm
+        response = llm.invoke(prompt)
+        return response.content.strip()
+    except Exception:
+        return f"**Destination:** Detected from query\n**Duration:** Checked itinerary\n**Budget:** Checked query"
+
 
 st.set_page_config(
     page_title="AI Travel Booking System",
@@ -297,6 +634,47 @@ div[data-testid="stDownloadButton"] > button {
     border: 1px solid #2a5080 !important;
     border-radius: 10px !important;
 }
+
+/* ── Attraction Card Custom CSS ── */
+.attraction-card {
+    width: 300px;
+    min-width: 300px;
+    max-width: 300px;
+    background: #0e1623;
+    border: 1px solid #1e2e44;
+    border-radius: 16px;
+    overflow: hidden;
+    margin: 0.5rem 0 1rem 1rem;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+}
+
+.attraction-card img {
+    width: 100%;
+    height: 140px;
+    object-fit: cover;
+    display: block;
+}
+
+.attraction-card-body {
+    padding: 0.7rem 0.9rem;
+}
+
+.attraction-name {
+    color: #e8f4ff !important;
+    font-size: 0.9rem !important;
+    font-weight: 600 !important;
+    margin-bottom: 0.3rem !important;
+}
+
+.attraction-card a {
+    color: #4ea8f0 !important;
+    font-size: 0.75rem !important;
+    text-decoration: none !important;
+}
+
+.attraction-card a:hover {
+    text-decoration: underline !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -305,9 +683,118 @@ with st.sidebar:
     st.markdown("<div class='sidebar-title'>🌍 AI Travel Planner</div>", unsafe_allow_html=True)
     st.markdown("---")
 
-    thread_id = st.text_input("👤 User ID", value="aarohi_user",
-                              help="Your session ID — keeps travel history across queries")
+    # ── Chat history persistence ──
+    # Initialize tables
+    create_chat_tables()
 
+    # New chat button
+    if st.button("➕ New Chat", use_container_width=True):
+        new_id = str(uuid.uuid4())
+        create_chat(new_id, "New Chat")
+        save_chat_state(new_id, {}, {}, "")
+        activate_chat(new_id)
+        st.session_state.current_plan_summary = ""
+        st.session_state.saved_filename = ""
+        st.session_state.saved_file_content = ""
+        st.rerun()
+
+    st.markdown("<div class='sidebar-title'>💬 Recent Chats</div>", unsafe_allow_html=True)
+    chats = list_chats()
+    
+    if not chats:
+        default_id = str(uuid.uuid4())
+        create_chat(default_id, "New Chat")
+        st.session_state.current_chat_id = default_id
+        chats = list_chats()
+        
+    if "current_chat_id" not in st.session_state or st.session_state.current_chat_id is None:
+        st.session_state.current_chat_id = chats[0]["chat_id"]
+
+    active_chat_id = st.session_state.current_chat_id
+
+    for c in chats:
+        c_id = c["chat_id"]
+        c_title = c["title"]
+        
+        is_active = (c_id == active_chat_id)
+        btn_label = f"📍 {c_title}" if is_active else f"📄 {c_title}"
+        
+        if st.button(btn_label, key=f"chat_select_{c_id}", use_container_width=True):
+            activate_chat(c_id)
+            st.session_state.current_plan_summary = ""
+            
+            # Rebuild saved file content from the active session state
+            active_session = st.session_state.chat_sessions[c_id]
+            parsed = active_session["travel_results"]
+            
+            if parsed.get("itinerary"):
+                latest_user_msgs = [m for m in active_session["messages"] if m["role"] == "user"]
+                latest_user_query = latest_user_msgs[-1]["content"] if latest_user_msgs else ""
+                timestamp = c["updated_at"].strftime("%Y%m%d_%H%M%S") if c["updated_at"] else "now"
+                st.session_state.saved_filename = f"travel_plan_{timestamp}.md"
+                st.session_state.saved_file_content = f"""# Travel Plan
+**Title:** {c_title}
+**Query:** {latest_user_query}
+**User ID:** {c_id}
+
+---
+
+## ✈️ Flight Information
+{parsed.get('flight_results') or 'N/A'}
+
+---
+
+## 🏨 Hotel Information
+{parsed.get('hotel_results') or 'N/A'}
+
+---
+
+## 🌦️ Weather Information
+{parsed.get('weather_results') or 'N/A'}
+
+---
+
+## 🗓️ Itinerary
+{parsed.get('itinerary') or 'N/A'}
+
+---
+
+## 🧠 Final Travel Plan
+{parsed.get('final_response') or 'N/A'}
+"""
+            else:
+                st.session_state.saved_filename = ""
+                st.session_state.saved_file_content = ""
+            st.rerun()
+
+        if is_active:
+            col_rename, col_delete = st.columns(2)
+            with col_rename:
+                with st.popover("✏️ Rename", use_container_width=True):
+                    new_title = st.text_input("New Title", value=c_title, key=f"rename_input_{c_id}")
+                    if st.button("Save", key=f"rename_save_{c_id}", use_container_width=True):
+                        rename_chat(c_id, new_title)
+                        st.rerun()
+            with col_delete:
+                with st.popover("🗑️ Delete", use_container_width=True):
+                    st.write("Confirm delete?")
+                    if st.button("Yes, Delete", key=f"delete_confirm_{c_id}", use_container_width=True):
+                        delete_chat(c_id)
+                        st.session_state.chat_sessions.pop(c_id, None)
+                        remaining_chats = list_chats()
+                        if remaining_chats:
+                            next_id = remaining_chats[0]["chat_id"]
+                            st.session_state.current_chat_id = next_id
+                            activate_chat(next_id)
+                        else:
+                            new_id = str(uuid.uuid4())
+                            create_chat(new_id, "New Chat")
+                            save_chat_state(new_id, {}, {}, "")
+                            st.session_state.current_chat_id = new_id
+                            activate_chat(new_id)
+                        st.rerun()
+
+    st.markdown("---")
     st.markdown("<div class='sidebar-title'>Powered by</div>", unsafe_allow_html=True)
     for tech in ["🔗 LangGraph", "🧠 Groq · LLaMA 3.3 70B", "🐘 PostgreSQL", "🔍 Tavily Search", "✈️ AviationStack"]:
         st.markdown(f"<div class='sidebar-chip'>{tech}</div>", unsafe_allow_html=True)
@@ -316,148 +803,425 @@ with st.sidebar:
     for step in ["① Flight Agent", "② Hotel Agent", "③ Itinerary Agent", "④ Final Agent"]:
         st.markdown(f"<div class='sidebar-chip'>{step}</div>", unsafe_allow_html=True)
 
-# ── Hero ──────────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="hero-wrapper">
-    <img class="hero-bg"
-         src="https://images.unsplash.com/photo-1436491865332-7a61a109cc05?w=1400&q=80"
-         alt="airplane above clouds"/>
-    <div class="hero-content">
-        <div class="hero-badge">✦ Multi-Agent AI System</div>
-        <div class="hero-title">✈️ AI Travel Booking System</div>
-        <div class="hero-sub">Four specialized agents work together — searching flights, hotels, building an itinerary, and delivering your perfect trip plan.</div>
+# End of helper declarations
+
+# Initialize Session State Variables
+if "chat_sessions" not in st.session_state:
+    st.session_state.chat_sessions = {}
+
+# Ensure we have active chat loaded
+chats = list_chats()
+if not chats:
+    new_id = str(uuid.uuid4())
+    create_chat(new_id, "New Chat")
+    save_chat_state(new_id, {}, {}, "")
+    chats = list_chats()
+
+if "current_chat_id" not in st.session_state or st.session_state.current_chat_id is None:
+    st.session_state.current_chat_id = chats[0]["chat_id"]
+
+current_chat_id = st.session_state.current_chat_id
+
+# Always sync active chat with database on every run
+activate_chat(current_chat_id)
+
+# Bind active chat variables to st.session_state keys
+active_session = st.session_state.chat_sessions[current_chat_id]
+st.session_state.chat_messages = active_session["messages"]
+st.session_state.travel_results = active_session["travel_results"]
+st.session_state.generated_itinerary = active_session["generated_itinerary"]
+st.session_state.plan_generated = bool(st.session_state.travel_results.get("itinerary"))
+
+if "saved_filename" not in st.session_state:
+    st.session_state.saved_filename = ""
+
+if "saved_file_content" not in st.session_state:
+    st.session_state.saved_file_content = ""
+
+# ── Render Hero or Compact Header ──────────────────────────────────────────────
+if not st.session_state.chat_messages:
+    st.markdown("""
+    <div class="hero-wrapper">
+        <img class="hero-bg"
+             src="https://images.unsplash.com/photo-1436491865332-7a61a109cc05?w=1400&q=80"
+             alt="airplane above clouds"/>
+        <div class="hero-content">
+            <div class="hero-badge">✦ Multi-Agent AI System</div>
+            <div class="hero-title">✈️ AI Travel Booking System</div>
+            <div class="hero-sub">Four specialized agents work together — searching flights, hotels, building an itinerary, and delivering your perfect trip plan.</div>
+        </div>
     </div>
-</div>
-""", unsafe_allow_html=True)
+    """, unsafe_allow_html=True)
+    
+    # Destination chips template
+    st.markdown("<div class='input-label'>🗺️ Quick Suggestions</div>", unsafe_allow_html=True)
+    QUICK = ["Plan a 7-day Japan trip under ₹2 lakhs.", "Plan a Paris trip for 5 days.", "Plan a Dubai weekend trip.", "Plan a Bali backpacking 10 days."]
+    qcols = st.columns(len(QUICK))
+    for qc, label in zip(qcols, QUICK):
+        with qc:
+            if st.button(label, key=f"q_{label}", use_container_width=True):
+                st.session_state.trigger_query = label
+                st.rerun()
+else:
+    # Show a simple compact header when in chat mode
+    st.markdown("""
+    <div style="display: flex; align-items: center; gap: 0.8rem; margin-bottom: 1.5rem;">
+        <span style="font-size: 1.8rem;">✈️</span>
+        <h2 style="margin: 0; color: #e8f4ff;">Conversational Travel Assistant</h2>
+    </div>
+    """, unsafe_allow_html=True)
 
-# ── Destination image strip ───────────────────────────────────────────────────
-DESTINATIONS = [
-    ("🇯🇵 Tokyo",     "https://images.unsplash.com/photo-1540959733332-eab4deabeeaf?w=300&q=70"),
-    ("🇫🇷 Paris",     "https://images.unsplash.com/photo-1502602898657-3e91760cbb34?w=300&q=70"),
-    ("🇹🇭 Bangkok",   "https://images.unsplash.com/photo-1508009603885-50cf7c579365?w=300&q=70"),
-    ("🇮🇹 Rome",      "https://images.unsplash.com/photo-1552832230-c0197dd311b5?w=300&q=70"),
-    ("🇦🇪 Dubai",     "https://images.unsplash.com/photo-1512453979798-5ea266f8880c?w=300&q=70"),
-]
+# ── Current Plan Summary Card ──────────────────────────────────────────────────
+if st.session_state.plan_generated:
+    config = {"configurable": {"thread_id": st.session_state.current_chat_id}}
+    try:
+        state_snapshot = app.get_state(config)
+        current_plan_json = state_snapshot.values.get("current_plan", "{}") if state_snapshot and state_snapshot.values else "{}"
+        plan_dict = json.loads(current_plan_json)
+    except Exception:
+        plan_dict = {}
 
-cols = st.columns(5)
-for col, (name, img_url) in zip(cols, DESTINATIONS):
-    with col:
+    if plan_dict and plan_dict.get("destination"):
+        cities_val = plan_dict.get('cities', [])
+        cities_str = ', '.join(cities_val) if isinstance(cities_val, list) else str(cities_val)
+        
+        st.session_state.current_plan_summary = f"""**Destination:** {plan_dict.get('destination', 'N/A')}
+**Duration:** {plan_dict.get('duration', 'N/A')} days
+**Budget:** {plan_dict.get('budget', 'N/A')}
+**Departure:** {plan_dict.get('departure_city', 'N/A')}
+**Main cities:** {cities_str}"""
+
         st.markdown(f"""
-        <div style="border-radius:10px;overflow:hidden;position:relative;height:90px;cursor:pointer;">
-            <img src="{img_url}" style="width:100%;height:100%;object-fit:cover;filter:brightness(0.55);" />
-            <div style="position:absolute;bottom:8px;left:0;right:0;text-align:center;
-                        color:#fff;font-size:0.8rem;font-weight:600;">{name}</div>
+        <div style="background: #0e1623; border: 1px solid #1e2e44; border-radius: 12px; padding: 1.2rem; margin-bottom: 1.5rem;">
+            <div style="color: #7ab8f5; font-size: 0.85rem; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; margin-bottom: 0.5rem;">📍 Current Plan Summary</div>
+            <div style="font-size: 0.92rem; line-height: 1.6; color: #cce0f5;">
+                {st.session_state.current_plan_summary.replace('\n', '<br>')}
+            </div>
         </div>
         """, unsafe_allow_html=True)
 
-st.markdown("<br>", unsafe_allow_html=True)
+# ── Render Chat Messages ───────────────────────────────────────────────────────
+for idx, msg in enumerate(st.session_state.chat_messages):
+    role = msg["role"]
+    content = msg["content"]
+    
+    with st.chat_message(role):
+        if role == "user":
+            st.markdown(content)
+            
+            # Show edit popover only for the last user message
+            last_user_idx = -1
+            for i, m in enumerate(st.session_state.chat_messages):
+                if m["role"] == "user":
+                    last_user_idx = i
+            
+            if idx == last_user_idx:
+                with st.popover("✏️ Edit Last Request"):
+                    edited_query = st.text_area("Modify your request", value=content, key=f"edit_query_{idx}")
+                    if st.button("Submit Changes", key=f"edit_submit_{idx}"):
+                        update_last_user_message(st.session_state.current_chat_id, edited_query)
+                        # Delete corresponding assistant message if exists
+                        if idx + 1 < len(st.session_state.chat_messages) and st.session_state.chat_messages[idx+1]["role"] == "assistant":
+                            delete_last_message(st.session_state.current_chat_id)
+                        st.session_state.chat_messages = load_messages(st.session_state.current_chat_id)
+                        st.session_state.trigger_query = edited_query
+                        st.rerun()
+        
+        elif role == "assistant":
+            parsed = parse_assistant_message(content)
+            
+            assoc_user_query = ""
+            if idx > 0 and st.session_state.chat_messages[idx-1]["role"] == "user":
+                assoc_user_query = st.session_state.chat_messages[idx-1]["content"]
+                
+            render_assistant_response(parsed, assoc_user_query)
+            
+            # Show Download button and auto-save info block for any plan message
+            if parsed.get("itinerary") or parsed.get("flight_results"):
+                if idx == len(st.session_state.chat_messages) - 1:
+                    if st.session_state.saved_filename and st.session_state.saved_file_content:
+                        download_column, info_column = st.columns([1, 3])
+                        with download_column:
+                            st.download_button(
+                                "⬇️ Download Plan",
+                                data=st.session_state.saved_file_content,
+                                file_name=st.session_state.saved_filename,
+                                mime="text/markdown",
+                                use_container_width=True,
+                            )
+                        with info_column:
+                            st.markdown(
+                                "<div class='save-bar'>"
+                                f"📁 Auto-saved → "
+                                f"<code>travel_plans/{st.session_state.saved_filename}</code>"
+                                "</div>",
+                                unsafe_allow_html=True,
+                            )
+                else:
+                    turn_download = f"""# Travel Plan
+**Generated:** {msg['created_at'].strftime("%Y-%m-%d %H:%M:%S") if msg.get('created_at') else 'N/A'}
+**User ID:** {st.session_state.current_chat_id}
 
-# ── Input ─────────────────────────────────────────────────────────────────────
-st.markdown("<div class='input-label'>🗺️ Describe your trip</div>", unsafe_allow_html=True)
+---
 
-QUICK = ["7-day Japan under ₹2L", "Paris trip for 5 days", "Dubai weekend trip", "Bali backpacking 10 days"]
-qcols = st.columns(len(QUICK))
-quick_fill = ""
-for qc, label in zip(qcols, QUICK):
-    with qc:
-        if st.button(label, key=f"q_{label}"):
-            quick_fill = label
+## ✈️ Flight Information
+{parsed.get('flight_results') or 'N/A'}
 
-user_query = st.text_area(
-    "",
-    value=quick_fill,
-    placeholder="e.g. Plan a complete 7-day Japan trip including flights, hotels and sightseeing under ₹2 lakhs",
-    height=100,
-    label_visibility="collapsed",
-)
+---
 
-generate = st.button("🚀  Generate My Travel Plan", use_container_width=True)
+## 🏨 Hotel Information
+{parsed.get('hotel_results') or 'N/A'}
 
-# ── Agent pipeline ────────────────────────────────────────────────────────────
+---
+
+## 🌦️ Weather Information
+{parsed.get('weather_results') or 'N/A'}
+
+---
+
+## 🗓️ Itinerary
+{parsed.get('itinerary') or 'N/A'}
+"""
+                    col_dl, col_space = st.columns([1, 2])
+                    with col_dl:
+                        st.download_button(
+                            "⬇️ Download Plan",
+                            data=turn_download,
+                            file_name=f"travel_plan_{idx}.md",
+                            mime="text/markdown",
+                            key=f"dl_{idx}",
+                            use_container_width=True
+                        )
+                
+            # If last assistant response, show Regenerate option
+            if idx == len(st.session_state.chat_messages) - 1:
+                if st.button("🔄 Regenerate Last Response", key=f"regenerate_{idx}"):
+                    delete_last_message(st.session_state.current_chat_id)
+                    user_msgs = [m for m in st.session_state.chat_messages if m["role"] == "user"]
+                    if user_msgs:
+                        last_query = user_msgs[-1]["content"]
+                        st.session_state.chat_messages = load_messages(st.session_state.current_chat_id)
+                        st.session_state.trigger_query = last_query
+                        st.rerun()
+
+# ── Agent pipeline execution live stream ──────────────────────────────────────
 AGENT_META = {
-    "flight_agent":    ("✈️", "Flight Agent"),
-    "hotel_agent":     ("🏨", "Hotel Agent"),
+    "flight_agent": ("✈️", "Flight Agent"),
+    "hotel_agent": ("🏨", "Hotel Agent"),
+    "weather_agent": ("🌦️", "Weather Agent"),
     "itinerary_agent": ("🗓️", "Itinerary Agent"),
-    "final_agent":     ("🧠", "Final Agent"),
 }
 
-if generate:
-    if not user_query.strip():
-        st.warning("Please describe your trip first.")
-    else:
-        config = {"configurable": {"thread_id": thread_id}}
-        collected = {"flight_results": "", "hotel_results": "",
-                     "itinerary": "", "final_response": "", "llm_calls": 0}
-
+if st.session_state.chat_messages and st.session_state.chat_messages[-1]["role"] == "user":
+    last_query = st.session_state.chat_messages[-1]["content"]
+    
+    with st.chat_message("assistant"):
         st.markdown("---")
-        st.markdown("<div class='sec-head'><span>🤖 Agent Pipeline — Live</span></div>",
-                    unsafe_allow_html=True)
-
-        for chunk in app.stream(
-            {
-                "messages": [HumanMessage(content=user_query)],
-                "user_query": user_query,
+        st.markdown(
+            "<div class='sec-head'><span>🤖 Agent Pipeline — Live</span></div>",
+            unsafe_allow_html=True,
+        )
+        
+        collected = {
+            "flight_results": "",
+            "hotel_results": "",
+            "weather_results": "",
+            "itinerary": "",
+            "final_response": "",
+            "llm_calls": 0,
+        }
+        
+        # Format conversation history
+        graph_messages = []
+        for m in st.session_state.chat_messages:
+            if m["role"] == "user":
+                graph_messages.append(HumanMessage(content=m["content"]))
+            elif m["role"] == "assistant":
+                parsed = parse_assistant_message(m["content"])
+                assistant_text = parsed.get("itinerary", "")
+                if parsed.get("final_response"):
+                    assistant_text += "\n" + parsed["final_response"]
+                graph_messages.append(AIMessage(content=assistant_text))
+                
+        config = {"configurable": {"thread_id": st.session_state.current_chat_id}}
+        
+        state_snapshot = app.get_state(config)
+        if state_snapshot.values:
+            inputs = {
+                "messages": [HumanMessage(content=last_query)],
+                "user_query": last_query,
+            }
+        else:
+            inputs = {
+                "messages": [HumanMessage(content=last_query)],
+                "user_query": last_query,
                 "flight_results": "",
                 "hotel_results": "",
+                "weather_results": "",
                 "itinerary": "",
                 "llm_calls": 0,
-            },
-            config=config,
-            stream_mode="updates",
-        ):
-            for node_name, state_update in chunk.items():
-                icon, label = AGENT_META.get(node_name, ("🔧", node_name))
-
-                with st.status(f"{icon}  {label}", state="complete", expanded=True):
+            }
+            
+        try:
+            current_classification = {}
+            for chunk in app.stream(
+                inputs,
+                config=config,
+                stream_mode="updates",
+            ):
+                for node_name, state_update in chunk.items():
+                    # Parse classification if available in flight_agent update
                     if node_name == "flight_agent":
-                        text = state_update.get("flight_results", "")
-                        collected["flight_results"] = text
-                        st.markdown(text or "_No flight data returned._")
+                        mod_type = state_update.get("modification_type", "{}")
+                        try:
+                            current_classification = json.loads(mod_type)
+                        except Exception:
+                            pass
+                            
+                    # Check execution flags
+                    show_node = True
+                    if current_classification:
+                        req_type = current_classification.get("request_type", "full_plan")
+                        if req_type in ["plan_question", "general_conversation"]:
+                            show_node = False
+                        else:
+                            if node_name == "flight_agent":
+                                show_node = current_classification.get("needs_flight_agent", True)
+                            elif node_name == "hotel_agent":
+                                show_node = current_classification.get("needs_hotel_agent", True)
+                            elif node_name == "weather_agent":
+                                show_node = current_classification.get("needs_weather_agent", True)
+                            elif node_name == "itinerary_agent":
+                                show_node = current_classification.get("needs_itinerary_agent", True)
+                                
+                    if not show_node:
+                        continue
+                        
+                    icon, label = AGENT_META.get(
+                        node_name,
+                        ("🔧", node_name),
+                    )
 
-                    elif node_name == "hotel_agent":
-                        text = state_update.get("hotel_results", "")
-                        collected["hotel_results"] = text
-                        st.markdown(text or "_No hotel data returned._")
+                    with st.status(
+                        f"{icon}  {label}",
+                        state="complete",
+                        expanded=True,
+                    ):
+                        if node_name == "flight_agent":
+                            agent_text = state_update.get("flight_results", "")
+                            collected["flight_results"] = agent_text
+                            render_flight_section(agent_text)
 
-                    elif node_name == "itinerary_agent":
-                        text = state_update.get("itinerary", "")
-                        collected["itinerary"] = text
-                        st.markdown(text or "_No itinerary generated._")
+                        elif node_name == "hotel_agent":
+                            agent_text = state_update.get("hotel_results", "")
+                            collected["hotel_results"] = agent_text
+                            render_hotel_section(agent_text)
 
-                    elif node_name == "final_agent":
-                        msgs = state_update.get("messages", [])
-                        text = msgs[-1].content if msgs else ""
-                        collected["final_response"] = text
-                        st.markdown(text or "_No final response._")
+                        elif node_name == "weather_agent":
+                            agent_text = state_update.get("weather_results", "")
+                            collected["weather_results"] = agent_text
+                            render_weather_section(agent_text)
 
-                    collected["llm_calls"] = state_update.get("llm_calls", collected["llm_calls"])
+                        elif node_name == "itinerary_agent":
+                            agent_text = state_update.get("itinerary", "")
+                            collected["itinerary"] = agent_text
+                            st.session_state.generated_itinerary = agent_text
+                            
+                            # If specific day change, render day confirm only
+                            if current_classification.get("request_type") in ["specific_day_change", "attraction_add", "attraction_remove"]:
+                                disp_text = state_update.get("messages", [AIMessage(content="")])[-1].content
+                                render_itinerary_section(disp_text, user_query)
+                            else:
+                                render_itinerary_section(agent_text, user_query)
 
-        # Metrics
-        st.markdown(f"""
-        <div class="metric-row">
-            <div class="metric-box"><div class="metric-val">4</div><div class="metric-lbl">Agents Run</div></div>
-            <div class="metric-box"><div class="metric-val">{collected['llm_calls']}</div><div class="metric-lbl">LLM Calls</div></div>
-            <div class="metric-box"><div class="metric-val">✅</div><div class="metric-lbl">Status</div></div>
-        </div>
-        """, unsafe_allow_html=True)
+                        collected["llm_calls"] = state_update.get(
+                            "llm_calls",
+                            collected["llm_calls"],
+                        )
+                        
+            final_snapshot = app.get_state(config)
+            classification_str = final_snapshot.values.get("modification_type", "{}") if final_snapshot and final_snapshot.values else "{}"
+            classification = json.loads(classification_str)
+            request_type = classification.get("request_type", "full_plan")
+            
+            final_messages = final_snapshot.values.get("messages", []) if final_snapshot and final_snapshot.values else []
+            if final_messages:
+                collected["final_response"] = final_messages[-1].content
+                
+            if request_type == "flight_request":
+                collected["displayed_response"] = f"### ✈️ Updated Flight Information\n\n{collected['flight_results']}"
+            elif request_type == "hotel_request":
+                collected["displayed_response"] = f"### 🏨 Updated Hotel Information\n\n{collected['hotel_results']}"
+            elif request_type == "weather_request":
+                collected["displayed_response"] = f"### 🌦️ Weather Information\n\n{collected['weather_results']}"
+            elif request_type in ["specific_day_change", "attraction_add", "attraction_remove"]:
+                collected["displayed_response"] = collected.get("final_response") or "I have modified the day in your itinerary."
+            elif request_type in ["duration_change", "budget_change", "itinerary_change"]:
+                collected["displayed_response"] = f"### 🗓️ Updated Itinerary\n\n{collected['itinerary']}"
+            elif request_type in ["plan_question", "general_conversation"]:
+                collected["displayed_response"] = collected.get("final_response") or "I have answered your question."
+            else:
+                collected["displayed_response"] = f"""### ✈️ Flight Information
+{collected['flight_results'] or 'N/A'}
 
-        # Final plan card
-        if collected["final_response"]:
-            st.markdown("<div class='sec-head'><span>🧠 Final Travel Plan</span></div>",
-                        unsafe_allow_html=True)
-            st.markdown(f"<div class='final-card'>{collected['final_response']}</div>",
-                        unsafe_allow_html=True)
+---
 
-        # Save
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"travel_plan_{timestamp}.md"
-        save_dir = os.path.join(os.path.dirname(__file__), "travel_plans")
-        os.makedirs(save_dir, exist_ok=True)
+### 🏨 Hotel Information
+{collected['hotel_results'] or 'N/A'}
 
-        file_content = f"""# Travel Plan
-**Query:** {user_query}
+---
+
+### 🌦️ Weather Information
+{collected['weather_results'] or 'N/A'}
+
+---
+
+### 🗓️ Travel Itinerary
+{collected['itinerary'] or 'N/A'}
+"""
+            
+            save_message(st.session_state.current_chat_id, "assistant", json.dumps(collected))
+                
+            # Parse target plan details
+            current_plan_json = final_snapshot.values.get("current_plan", "{}") if final_snapshot and final_snapshot.values else "{}"
+            try:
+                current_plan_dict = json.loads(current_plan_json)
+            except Exception:
+                current_plan_dict = {}
+                
+            # Persist plan state to PostgreSQL
+            save_chat_state(
+                st.session_state.current_chat_id,
+                current_plan_dict,
+                collected,
+                collected.get("itinerary", "")
+            )
+            
+            # Sync active session state dictionary
+            active_session = st.session_state.chat_sessions[st.session_state.current_chat_id]
+            active_session["messages"] = load_messages(st.session_state.current_chat_id)
+            active_session["travel_results"] = collected
+            active_session["generated_itinerary"] = collected.get("itinerary", "")
+            active_session["current_plan"] = current_plan_dict
+            
+            st.session_state.chat_messages = active_session["messages"]
+            st.session_state.travel_results = active_session["travel_results"]
+            st.session_state.generated_itinerary = active_session["generated_itinerary"]
+            st.session_state.plan_generated = bool(collected.get("itinerary"))
+            
+            # Save final file (Auto-save)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            filename = f"travel_plan_{timestamp}.md"
+            save_dir = os.path.join(
+                os.path.dirname(__file__),
+                "travel_plans",
+            )
+            os.makedirs(save_dir, exist_ok=True)
+
+            file_content = f"""# Travel Plan
+**Query:** {last_query}
 **Generated:** {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-**User ID:** {thread_id}
+**User ID:** {st.session_state.current_chat_id}
 
 ---
 
@@ -468,6 +1232,11 @@ if generate:
 
 ## 🏨 Hotel Information
 {collected['hotel_results'] or 'N/A'}
+
+---
+
+## 🌦️ Weather Information
+{collected['weather_results'] or 'N/A'}
 
 ---
 
@@ -482,14 +1251,60 @@ if generate:
 ---
 *LLM Calls: {collected['llm_calls']}*
 """
-        with open(os.path.join(save_dir, filename), "w", encoding="utf-8") as f:
-            f.write(file_content)
 
-        dl_col, info_col = st.columns([1, 3])
-        with dl_col:
-            st.download_button("⬇️ Download Plan", data=file_content,
-                               file_name=filename, mime="text/markdown",
-                               use_container_width=True)
-        with info_col:
-            st.markdown(f"<div class='save-bar'>📁 Auto-saved → <code>travel_plans/{filename}</code></div>",
-                        unsafe_allow_html=True)
+            with open(
+                os.path.join(save_dir, filename),
+                "w",
+                encoding="utf-8",
+            ) as file:
+                file.write(file_content)
+
+            st.session_state.saved_filename = filename
+            st.session_state.saved_file_content = file_content
+            
+            st.session_state.current_plan_summary = ""
+            st.rerun()
+
+        except RuntimeError as error:
+            if "Event loop is closed" in str(error):
+                st.error(
+                    "The async runtime was reset unexpectedly. "
+                    "Please retry the request."
+                )
+            else:
+                st.error(
+                    "The travel plan could not be completed. "
+                    f"Error: {error}"
+                )
+        except Exception as error:
+            st.error(
+                "The travel plan could not be completed. "
+                f"Error: {error}"
+            )
+
+# Handle Chat Input & Triggers
+user_query = st.chat_input("Ask a follow-up or plan a new trip...")
+
+if "trigger_query" in st.session_state and st.session_state.trigger_query:
+    user_query = st.session_state.trigger_query
+    st.session_state.trigger_query = ""
+
+if user_query:
+    user_query_clean = user_query.strip()
+    if user_query_clean:
+        chats = list_chats()
+        active_chat = next((c for c in chats if c["chat_id"] == st.session_state.current_chat_id), None)
+        
+        if active_chat and active_chat["title"] == "New Chat":
+            new_title = generate_chat_title(user_query_clean)
+            rename_chat(st.session_state.current_chat_id, new_title)
+            
+        save_message(st.session_state.current_chat_id, "user", user_query_clean)
+        st.session_state.chat_messages = load_messages(st.session_state.current_chat_id)
+        
+        if "current_plan_summary" in st.session_state:
+            st.session_state.current_plan_summary = ""
+            
+        st.rerun()
+
+
