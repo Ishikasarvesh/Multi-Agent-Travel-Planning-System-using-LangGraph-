@@ -1,9 +1,27 @@
 import re
 from typing import Optional
+from urllib.parse import quote_plus
 import requests
 import streamlit as st
+from url_builders import build_google_maps_link
 
 WIKIMEDIA_API_URL = "https://commons.wikimedia.org/w/api.php"
+
+def convert_markdown_links_to_target_blank(text: str) -> str:
+    """
+    Converts markdown links [Label](URL) in text to HTML anchor tags with target="_blank".
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    
+    def replacer(match):
+        label = match.group(1).strip()
+        url = match.group(2).strip()
+        if url.startswith("http://") or url.startswith("https://"):
+            return f'<a href="{url}" target="_blank" rel="noopener noreferrer" style="color: #4ea8f0; text-decoration: underline;">{label}</a>'
+        return label
+
+    return re.sub(r'\[([^\]]+)\]\(([^)]+)\)', replacer, text)
 
 # Words that should not be treated as tourist attractions.
 EXCLUDED_WORDS = {
@@ -423,8 +441,11 @@ def render_itinerary_with_inline_images(
         # Split the content of the day line-by-line
         lines = day_content.splitlines()
         for line in lines:
-            # Render the text line
-            st.markdown(line)
+            # Render the text line with clickable target_blank links if present
+            if "[" in line and "](" in line:
+                st.markdown(convert_markdown_links_to_target_blank(line), unsafe_allow_html=True)
+            else:
+                st.markdown(line)
             
             # Detect attraction in this single line
             stripped_line = line.strip()
@@ -441,13 +462,19 @@ def render_itinerary_with_inline_images(
                         country=country
                     )
                     if img_data:
-                        # Render fixed small ATM-card design
+                        # Generate Google Maps search URL for attraction
+                        maps_url = build_google_maps_link(img_data['title'], city=city)
+
+                        # Render fixed small ATM-card design with Google Maps link
                         card_html = f"""
                         <div class="attraction-card">
                             <img src="{img_data['image_url']}" />
                             <div class="attraction-card-body">
                                 <div class="attraction-name">{img_data['title']}</div>
-                                <a href="{img_data['source_url']}" target="_blank">View source</a>
+                                <div style="display: flex; gap: 0.8rem; margin-top: 0.3rem;">
+                                    <a href="{img_data['source_url']}" target="_blank" rel="noopener noreferrer">View source</a>
+                                    <a href="{maps_url}" target="_blank" rel="noopener noreferrer" style="color: #4ea8f0;">📍 Google Maps</a>
+                                </div>
                             </div>
                         </div>
                         """

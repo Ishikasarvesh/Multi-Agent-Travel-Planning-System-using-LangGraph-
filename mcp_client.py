@@ -1,25 +1,33 @@
 import os
+import sys
 import asyncio
+import traceback
+from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_mcp_adapters.client import MultiServerMCPClient
 
-#load_dotenv()
 load_dotenv(override=True)
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 AVIATION_STACK_API_KEY = os.getenv("AVIATIONSTACK_API_KEY")
 
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+RAILRADAR_API_KEY = os.getenv("RAILRADAR_API_KEY")
 
 import threading
 from typing import Any, Coroutine
 
-# Resolve weather server and interpreter path dynamically relative to the current file
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PYTHON_PATH = os.path.join(BASE_DIR, "langgraph_env", "Scripts", "python.exe")
-WEATHER_SERVER_PATH = os.path.join(BASE_DIR, "custom_weather_mcp_server.py")
+# Resolve weather, railway, and aviation server interpreter paths dynamically
+BASE_DIR = Path(__file__).resolve().parent
+PYTHON_PATH = sys.executable
 
-MCP_SERVERS = {
+AVIATION_VENV_PYTHON = r"C:\Users\ishik\Music\aviationstack-mcp\.venv\Scripts\python.exe"
+AVIATION_PYTHON = AVIATION_VENV_PYTHON if os.path.exists(AVIATION_VENV_PYTHON) else PYTHON_PATH
+
+WEATHER_SERVER_PATH = str(BASE_DIR / "custom_weather_mcp_server.py")
+RAILWAY_SERVER_PATH = str(BASE_DIR / "custom_railway_mcp_server.py")
+
+ALL_MCP_SERVERS = {
     "tavily": {
         "transport": "streamable_http",
         "url": f"https://mcp.tavily.com/mcp/?tavilyApiKey={TAVILY_API_KEY}"
@@ -27,7 +35,7 @@ MCP_SERVERS = {
 
     "aviationstack": {
         "transport": "stdio",
-        "command": r"C:\Users\ishik\Music\aviationstack-mcp\.venv\Scripts\python.exe",
+        "command": AVIATION_PYTHON,
         "args": [
             "-m",
             "aviationstack_mcp",
@@ -35,21 +43,44 @@ MCP_SERVERS = {
             "run"
         ],
         "env": {
-            "AVIATION_STACK_API_KEY": AVIATION_STACK_API_KEY
+            "AVIATION_STACK_API_KEY": AVIATION_STACK_API_KEY or ""
         }
     },
 
     "weather": {
-          "transport": "stdio",
-           "command": PYTHON_PATH,
-           "args": [
-                 WEATHER_SERVER_PATH
-                ],
-            "env": {
-        "OPENWEATHER_API_KEY": OPENWEATHER_API_KEY
+        "transport": "stdio",
+        "command": PYTHON_PATH,
+        "args": [
+            WEATHER_SERVER_PATH
+        ],
+        "env": {
+            "OPENWEATHER_API_KEY": OPENWEATHER_API_KEY or ""
+        }
+    },
+
+    "railway": {
+        "transport": "stdio",
+        "command": PYTHON_PATH,
+        "args": [
+            RAILWAY_SERVER_PATH
+        ],
+        "env": {
+            "RAILRADAR_API_KEY": RAILRADAR_API_KEY or "",
+            "TAVILY_API_KEY": TAVILY_API_KEY or ""
         }
     }
 }
+
+def log_nested_exception(exc, prefix=""):
+    """Recursively logs nested sub-exceptions inside BaseExceptionGroup / ExceptionGroup."""
+    if isinstance(exc, (BaseExceptionGroup, ExceptionGroup)):
+        print(f"{prefix}TaskGroup ExceptionGroup ({len(exc.exceptions)} sub-exceptions):")
+        for idx, sub in enumerate(exc.exceptions, start=1):
+            print(f"{prefix}  Sub-exception {idx}: {type(sub).__name__}: {sub}")
+            log_nested_exception(sub, prefix + "    ")
+    else:
+        print(f"{prefix}Inner Exception [{type(exc).__name__}]: {exc}")
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
 
 # Thread-safe helper to run async tasks in Streamlit
 def run_async_safely(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -86,105 +117,101 @@ def run_async_safely(coro: Coroutine[Any, Any, Any]) -> Any:
     return result_container.get("value")
 
 
-_client = None
-_client_loop = None
-search_tool = None
-aviation_tools = {}
-weather_tool = None
-forecast_tool = None
+_server_clients = {}
 
-async def get_client_and_tools():
-    """Returns the MultiServerMCPClient and its tools. Recreates client sessions if event loop changes."""
-    global _client, _client_loop, search_tool, aviation_tools, weather_tool, forecast_tool
+async def get_mcp_tools_for_server(server_name: str):
+    """Initializes and returns tools for a specific MCP server safely in isolation."""
+    global _server_clients
     try:
         current_loop = asyncio.get_running_loop()
     except RuntimeError:
         current_loop = None
 
-    if _client is None or _client_loop != current_loop:
-        _client = MultiServerMCPClient(MCP_SERVERS)
-        _client_loop = current_loop
-        
-        tools = await _client.get_tools()
-        
-        search_tool = next(
-            tool
-            for tool in tools
-            if tool.name == "tavily_search"
-        )
-        
-        aviation_tools = {
-            tool.name: tool
-            for tool in tools
-            if tool.name != "tavily_search"
-        }
-        
-        weather_tool = next(
-            t for t in tools
-            if t.name == "get_current_weather"
-        )
-        
-        forecast_tool = next(
-            t for t in tools
-            if t.name == "get_forecast"
-        )
+    cached = _server_clients.get(server_name)
+    if cached and cached.get("loop") == current_loop:
+        return cached["tools"]
+
+    if server_name not in ALL_MCP_SERVERS:
+        return []
+
+    server_cfg = ALL_MCP_SERVERS[server_name]
+    print(f"\n[MCP LOG] Initializing MCP server '{server_name}'...")
+    try:
+        client = MultiServerMCPClient({server_name: server_cfg})
+        tools = await client.get_tools()
+        _server_clients[server_name] = {"client": client, "tools": tools, "loop": current_loop}
+        return tools
+    except (BaseExceptionGroup, ExceptionGroup, Exception) as exc:
+        print(f"\n[MCP ERROR] Failed to initialize server '{server_name}':")
+        log_nested_exception(exc)
+        return []
 
 async def tavily_mcp_search(query: str):
-    await get_client_and_tools()
-    result = await search_tool.ainvoke(
-        {
-            "query": query
-        }
-    )
-    return result
+    tools = await get_mcp_tools_for_server("tavily")
+    search_tool = next((t for t in tools if t.name == "tavily_search"), None)
+    if search_tool:
+        return await search_tool.ainvoke({"query": query})
+    return ""
 
 async def aviation_mcp_call(
     tool_name: str,
     tool_args: dict = None
 ):
-    await get_client_and_tools()
-    # Fetch tools fresh from loop-bound client
-    tools = await _client.get_tools()
-    tool = next(
-        t for t in tools
-        if t.name == tool_name
-    )
-    result = await tool.ainvoke(
-        tool_args or {}
-    )
-    return result
+    tools = await get_mcp_tools_for_server("aviationstack")
+    tool = next((t for t in tools if t.name == tool_name), None)
+    if tool:
+        return await tool.ainvoke(tool_args or {})
+    return "Aviation tool unavailable"
 
 async def get_airports():
-    await get_client_and_tools()
-    tool = aviation_tools.get("list_airports")
+    tools = await get_mcp_tools_for_server("aviationstack")
+    tool = next((t for t in tools if t.name == "list_airports"), None)
     if not tool:
         return "Airport tool unavailable"
-    result = await tool.ainvoke({})
-    return result
+    return await tool.ainvoke({})
 
 async def get_airlines():
-    await get_client_and_tools()
-    tool = aviation_tools.get("list_airlines")
+    tools = await get_mcp_tools_for_server("aviationstack")
+    tool = next((t for t in tools if t.name == "list_airlines"), None)
     if not tool:
         return "Airline tool unavailable"
-    result = await tool.ainvoke({})
-    return result
+    return await tool.ainvoke({})
 
 async def weather_mcp_search(city: str):
-    await get_client_and_tools()
-    return await weather_tool.ainvoke(
-        {
-            "city": city
-        }
-    )
+    tools = await get_mcp_tools_for_server("weather")
+    weather_tool = next((t for t in tools if t.name == "get_current_weather"), None)
+    if weather_tool:
+        return await weather_tool.ainvoke({"city": city})
+    return {"status": "unavailable"}
 
 async def forecast_mcp_search(city: str):
-    await get_client_and_tools()
-    return await forecast_tool.ainvoke(
-        {
-            "city": city
-        }
-    )
+    tools = await get_mcp_tools_for_server("weather")
+    forecast_tool = next((t for t in tools if t.name == "get_forecast"), None)
+    if forecast_tool:
+        return await forecast_tool.ainvoke({"city": city})
+    return {"status": "unavailable"}
+
+async def railway_mcp_search(source: str, destination: str):
+    tools = await get_mcp_tools_for_server("railway")
+    railway_tool = next((t for t in tools if t.name == "search_trains"), None)
+    if railway_tool:
+        return await railway_tool.ainvoke({"source": source, "destination": destination})
+    
+    # Fallback to direct Tavily web search if railway server process failed
+    print("\n[RAILWAY FALLBACK] Using Tavily direct search for Indian Railways options...")
+    tav_res = await tavily_mcp_search(f"popular direct trains schedule timing fare from {source} to {destination} vande bharat express irctc")
+    return {
+        "status": "success",
+        "source": source,
+        "destination": destination,
+        "raw_search_notes": str(tav_res)[:2000],
+        "booking_platforms": [
+            {"name": "IRCTC", "url": "https://www.irctc.co.in/nget/train-search"},
+            {"name": "ConfirmTkt", "url": "https://www.confirmtkt.com/"},
+            {"name": "RailYatri", "url": "https://www.railyatri.in/train-tickets"}
+        ],
+        "tip": "Book AC coaches early during peak travel seasons as berths fill quickly."
+    }
 
 
 
